@@ -21,6 +21,7 @@ python3 orchestrator.py
 ### Get Server IP
 
 ```bash
+## wsl 
 hostname -I
 ```
 
