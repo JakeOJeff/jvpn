@@ -287,29 +287,26 @@ def cmd_connect():
 
     step(2, 3, "Bringing WireGuard tunnel up...")
     if IS_WINDOWS:
-        # wg-quick doesn't exist on Windows. WireGuard for Windows uses
-        # wireguard.exe /installtunnel which registers the tunnel as a
-        # Windows service and brings it up immediately.
-        result = run(f'wireguard.exe /installtunnel "{config_path}"', check=False)
-        if result.returncode != 0:
-            err(f"wireguard.exe failed:\n    {result.stdout.strip() or result.stderr.strip()}")
-            print()
-            info("Common fixes:")
-            info("  1. Run PowerShell as Administrator")
-            info("  2. Reinstall WireGuard for Windows: https://www.wireguard.com/install/")
-            info("  3. Check the server is running: python3 orchestrator.py status (on WL)")
-            sys.exit(1)
-        ok("WireGuard tunnel is UP")
+        # On Windows, wg-quick is installed by the WireGuard for Windows app.
+        # It's accessible as a PowerShell command.
+        result = run(f'wg-quick up "{config_path}"', check=False)
     else:
         result = run(f"sudo wg-quick up {config_path}", check=False)
-        if result.returncode != 0:
-            if "already exists" in result.stderr:
-                warn("Tunnel already active. Run `python cli.py disconnect` first.")
-            else:
-                err(f"wg-quick failed:\n    {result.stderr.strip()}")
-                sys.exit(1)
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "already exists" in stderr or "already active" in stderr.lower():
+            warn("Tunnel already active. Run `python cli.py disconnect` first if needed.")
         else:
-            ok("WireGuard tunnel is UP")
+            err(f"wg-quick failed:\n    {stderr}")
+            print()
+            info("Common fixes:")
+            info("  1. Run this terminal as Administrator")
+            info("  2. Make sure WireGuard for Windows is installed: https://www.wireguard.com/install/")
+            info("  3. Check that the server is running: python3 orchestrator.py status (on WL)")
+            sys.exit(1)
+    else:
+        ok("WireGuard tunnel is UP")
 
     step(3, 3, "Verifying connection...")
     time.sleep(2)  # give the tunnel a moment to establish
@@ -358,19 +355,16 @@ def cmd_disconnect():
         return
 
     if IS_WINDOWS:
-        # /uninstalltunnel takes the tunnel NAME (filename without .conf extension)
-        tunnel_name = config_path.stem  # "wg0-client"
-        result = run(f'wireguard.exe /uninstalltunnel {tunnel_name}', check=False)
+        result = run(f'wg-quick down "{config_path}"', check=False)
     else:
         result = run(f"sudo wg-quick down {config_path}", check=False)
 
     if result.returncode != 0:
-        stdout = result.stdout.strip()
         stderr = result.stderr.strip()
-        if "not found" in (stdout + stderr).lower() or "does not exist" in (stdout + stderr).lower():
+        if "not found" in stderr or "does not exist" in stderr.lower():
             info("Tunnel was already down.")
         else:
-            warn(f"Error during disconnect: {stdout or stderr}")
+            warn(f"wg-quick down returned an error: {stderr}")
     else:
         ok("VPN tunnel disconnected.")
         info("Your traffic now goes directly to the internet (not through VPN).")
