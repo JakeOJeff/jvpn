@@ -130,6 +130,7 @@ git --version
 
 ### Step 1: Start the server on WL
 
+Make sure Wireguard is installed on your client device.
 Open WSL2 (NixOS) and run:
 ```bash
 python3 orchestrator.py start
