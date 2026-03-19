@@ -1,0 +1,4 @@
+.wg-vpn/
+*.conf
+*.private
+peers.json
