@@ -1,285 +1,496 @@
 #!/usr/bin/env python3
 """
-cli.py
-------
-Runs on the VPN CLIENT (your PC WSL2).
-Manages your WireGuard tunnel by talking to the orchestrator.
+cli.py — The client-side VPN tool. Runs on WPC (Windows PC).
 
-Commands:
-  python3 cli.py init                → generate keypair, create config
-  python3 cli.py register <name>     → register with server, get VPN IP
-  python3 cli.py up                  → connect to VPN
-  python3 cli.py down                → disconnect
-  python3 cli.py status              → show tunnel state + public IP
+What this file does:
+  - Generates a WireGuard keypair for WPC (if it doesn't exist)
+  - Writes a WireGuard client config (wg0-client.conf)
+  - Calls wg-quick to connect/disconnect
+  - Shows connection status with helpful messages
 
-Config: ~/.config/vpn/config.json
-Run up/down with: sudo -E python3 cli.py up
+HOW TO RUN (on WPC, in a terminal with admin rights):
+  python cli.py init          — first-time setup: generate keys, show your public key
+  python cli.py connect       — connect to the VPN
+  python cli.py disconnect    — disconnect
+  python cli.py status        — show connection status
+  python cli.py ping          — ping the server through the VPN tunnel
 
-Requires:
-  pip install requests
-  sudo apt install wireguard-tools
+PREREQUISITES ON WPC:
+  1. Install Python 3: https://python.org
+  2. Install WireGuard for Windows: https://www.wireguard.com/install/
+     (This gives you `wg` and `wg-quick` commands in PowerShell)
+  3. Run your terminal as Administrator (WireGuard needs admin rights)
 """
 
-import argparse
-import json
-import os
 import subprocess
+import os
 import sys
+import time
+import platform
 from pathlib import Path
 
-# ── Config paths ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# Fill these in after running `python3 orchestrator.py add-peer` on the server.
+# The orchestrator prints the values you need.
+# ─────────────────────────────────────────────────────────────────────────────
 
-CONFIG_DIR  = Path.home() / ".config" / "vpn"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-KEY_FILE    = CONFIG_DIR / "private.key"
+# The Windows IP address of WL — the machine running the VPN server.
+# Find it by running `ipconfig` in a Windows terminal on WL and looking for
+# the IP of your main ethernet or WiFi adapter.
+# Example: "192.168.1.42"
+SERVER_ENDPOINT = "YOUR_WL_WINDOWS_IP_HERE"
 
-# VPN client interface name
-# wg1 so it doesn't clash with wg0 if testing on same machine
-CLIENT_IFACE = "wg1"
+# The server's WireGuard public key.
+# Printed when you run `python3 orchestrator.py start` on the server.
+SERVER_PUBLIC_KEY = "PASTE_SERVER_PUBLIC_KEY_HERE"
 
-# ── Config helpers ────────────────────────────────────────────────────────────
+# The VPN IP address assigned to THIS client (WPC).
+# Printed when you run `python3 orchestrator.py add-peer` on the server.
+CLIENT_VPN_IP = "10.0.0.2"
 
-def load_config() -> dict:
-    if not CONFIG_FILE.exists():
-        die(f"No config found. Run: python3 cli.py init")
-    return json.loads(CONFIG_FILE.read_text())
+# WireGuard port on the server
+SERVER_PORT = 51820
 
+# Where to store WPC's keys and config
+# On Windows, Path.home() gives C:\Users\YourName
+CONFIG_DIR = Path.home() / ".wg-vpn"
 
-def save_config(cfg: dict):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
-    CONFIG_FILE.chmod(0o600)
+# ─────────────────────────────────────────────────────────────────────────────
+# DETECT OPERATING SYSTEM
+#
+# `platform.system()` returns "Windows", "Linux", or "Darwin" (macOS).
+# We need this because:
+#   - wg-quick on Windows is called differently than on Linux
+#   - File paths use backslashes on Windows, forward slashes on Linux
+#   - We use different ping commands on Windows vs Linux
+# ─────────────────────────────────────────────────────────────────────────────
 
+IS_WINDOWS = platform.system() == "Windows"
 
-# ── Key helpers ───────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# PRETTY PRINTING HELPERS
+#
+# These just make the terminal output look nice.
+# ANSI escape codes are special character sequences that terminals interpret
+# as formatting instructions (color, bold, etc.).
+# ─────────────────────────────────────────────────────────────────────────────
 
-def generate_private_key() -> str:
-    return subprocess.run(
-        ["wg", "genkey"], capture_output=True, text=True, check=True
-    ).stdout.strip()
+# On Windows, ANSI codes only work in newer terminals (Windows Terminal, VS Code).
+# We check if we can use them.
+USE_COLOR = not IS_WINDOWS or os.environ.get("WT_SESSION")  # WT_SESSION = Windows Terminal
 
+GREEN  = "\033[92m" if USE_COLOR else ""
+YELLOW = "\033[93m" if USE_COLOR else ""
+RED    = "\033[91m" if USE_COLOR else ""
+BLUE   = "\033[94m" if USE_COLOR else ""
+BOLD   = "\033[1m"  if USE_COLOR else ""
+RESET  = "\033[0m"  if USE_COLOR else ""
 
-def derive_public_key(private_key: str) -> str:
-    return subprocess.run(
-        ["wg", "pubkey"], input=private_key,
-        capture_output=True, text=True, check=True
-    ).stdout.strip()
+def ok(msg):    print(f"{GREEN}  ✓{RESET} {msg}")
+def info(msg):  print(f"{BLUE}  ℹ{RESET} {msg}")
+def warn(msg):  print(f"{YELLOW}  ⚠{RESET} {msg}")
+def err(msg):   print(f"{RED}  ✗{RESET} {msg}")
+def step(n, total, msg): print(f"\n{BOLD}[{n}/{total}]{RESET} {msg}")
+def header(msg): print(f"\n{BOLD}══ {msg} ══{RESET}\n")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN SHELL COMMANDS
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ── Commands ──────────────────────────────────────────────────────────────────
+def run(cmd: str, check=True, capture=True, verbose=False) -> subprocess.CompletedProcess:
+    """Run a shell command. On Windows, use PowerShell."""
+    if verbose:
+        info(f"running: {cmd}")
 
-def cmd_init(args):
-    """Generate keypair and write initial config file."""
-    if CONFIG_FILE.exists():
-        print(f"Config already exists: {CONFIG_FILE}")
-        print("Delete it manually to reinitialise.")
-        return
-
-    print("Generating WireGuard keypair...")
-    private_key = generate_private_key()
-    public_key  = derive_public_key(private_key)
-
-    cfg = {
-        "private_key":        private_key,
-        "public_key":         public_key,
-        "orchestrator_url":   "http://YOUR_SERVER_IP:8080",
-        "dns":                "1.1.1.1",
-        # filled in after register:
-        "client_ip":          None,
-        "server_public_key":  None,
-        "server_endpoint":    None,
-    }
-    save_config(cfg)
-
-    print(f"\nConfig saved: {CONFIG_FILE}")
-    print(f"\nYour public key (server needs this):")
-    print(f"  {public_key}")
-    print(f"\nNext:")
-    print(f"  1. Edit {CONFIG_FILE}")
-    print(f"     Set orchestrator_url to http://LAPTOP_LOCAL_IP:8080")
-    print(f"  2. python3 cli.py register yourname")
-    print(f"  3. sudo -E python3 cli.py up")
-
-
-def cmd_register(args):
-    """Register with the server. Gets assigned a VPN IP."""
-    import requests
-
-    cfg = load_config()
-    url = cfg.get("orchestrator_url", "")
-
-    if "YOUR_SERVER_IP" in url or not url:
-        die(f"Set orchestrator_url in {CONFIG_FILE} to http://LAPTOP_IP:8080")
-
-    print(f"Registering '{args.name}' with {url}...")
-
-    try:
-        resp = requests.post(
-            f"{url}/peers",
-            json={"name": args.name, "public_key": cfg["public_key"]},
-            timeout=10
-        )
-        resp.raise_for_status()
-    except requests.exceptions.ConnectionError:
-        die(
-            f"Cannot reach orchestrator at {url}\n"
-            f"Is it running? Is the laptop IP correct?\n"
-            f"Try: curl {url}/health"
-        )
-    except requests.exceptions.HTTPError as e:
-        die(f"Server error: {e}\n{resp.text}")
-
-    data = resp.json()
-
-    cfg["client_ip"]        = data["ip"]
-    cfg["server_public_key"] = data["server_public_key"]
-    cfg["server_endpoint"]  = data["endpoint"]
-    save_config(cfg)
-
-    print(f"\nRegistered.")
-    print(f"  Your VPN IP    : {data['ip']}")
-    print(f"  Server endpoint: {data['endpoint']}")
-    print(f"\nRun: sudo -E python3 cli.py up")
-
-
-def cmd_up(args):
-    """Connect to the VPN."""
-    cfg = load_config()
-
-    missing = [k for k in ["client_ip", "server_public_key", "server_endpoint"]
-               if not cfg.get(k)]
-    if missing:
-        die(f"Missing config: {missing}\nRun: python3 cli.py register <name>")
-
-    print("Connecting...")
-
-    # write private key to temp file (wg needs a file path, not stdin)
-    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    KEY_FILE.write_text(cfg["private_key"])
-    KEY_FILE.chmod(0o600)
-
-    # clean up any leftover interface silently
-    subprocess.run(["ip", "link", "delete", CLIENT_IFACE],
-                   capture_output=True)
-
-    # create WireGuard interface
-    run(["ip", "link", "add", CLIENT_IFACE, "type", "wireguard"])
-
-    # assign VPN IP
-    run(["ip", "addr", "add", f"{cfg['client_ip']}/24", "dev", CLIENT_IFACE])
-
-    # configure WireGuard — keys, peer, endpoint
-    run(["wg", "set", CLIENT_IFACE,
-         "private-key", str(KEY_FILE),
-         "peer",         cfg["server_public_key"],
-         "endpoint",     cfg["server_endpoint"],
-         # route ALL traffic through VPN
-         # split into two halves to avoid WSL2 routing bug with 0.0.0.0/0
-         "allowed-ips",  "0.0.0.0/1,128.0.0.0/1",
-         "persistent-keepalive", "25"])
-
-    # bring interface up
-    run(["ip", "link", "set", CLIENT_IFACE, "up"])
-
-    # add routes — send all traffic through wg1
-    run(["ip", "route", "add", "0.0.0.0/1",   "dev", CLIENT_IFACE], ok_if_exists=True)
-    run(["ip", "route", "add", "128.0.0.0/1", "dev", CLIENT_IFACE], ok_if_exists=True)
-
-    # set DNS
-    try:
-        dns = cfg.get("dns", "1.1.1.1")
-        Path("/etc/resolv.conf").write_text(f"nameserver {dns}\n")
-    except PermissionError:
-        print("  (could not set DNS — run with sudo -E)")
-
-    print(f"Connected.")
-    print(f"  VPN IP : {cfg['client_ip']}")
-    print(f"  Server : {cfg['server_endpoint']}")
-    print(f"\nVerify: python3 cli.py status")
-
-
-def cmd_down(args):
-    """Disconnect from VPN."""
-    result = subprocess.run(
-        ["ip", "link", "delete", CLIENT_IFACE],
-        capture_output=True
-    )
-    if result.returncode != 0:
-        print("Not connected (interface not found).")
+    if IS_WINDOWS:
+        # On Windows, wrap the command in powershell.exe so we get access
+        # to wg-quick and other tools installed on Windows PATH.
+        full_cmd = ["powershell.exe", "-Command", cmd]
+        result = subprocess.run(full_cmd, capture_output=capture, text=True)
     else:
-        print("Disconnected.")
+        result = subprocess.run(cmd, shell=True, capture_output=capture, text=True)
 
+    if check and result.returncode != 0:
+        err(f"Command failed: {cmd}")
+        if result.stderr:
+            print(f"      {result.stderr.strip()}")
+        sys.exit(1)
 
-def cmd_status(args):
-    """Show current connection state and public IP."""
-    result = subprocess.run(["wg", "show"], capture_output=True, text=True)
+    return result
 
-    if result.returncode != 0 or not result.stdout.strip():
-        print("Status: disconnected")
+# ─────────────────────────────────────────────────────────────────────────────
+# KEY GENERATION (client side)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_client_keypair() -> tuple[str, str]:
+    """
+    Generate WPC's WireGuard keypair.
+
+    Same as the server side — we get a private key and a public key.
+    The public key is what you paste into the server's `add-peer` command.
+    The private key NEVER leaves WPC.
+
+    On Windows: WireGuard for Windows installs `wg.exe` and adds it to PATH.
+    `wg genkey` and `wg pubkey` work the same as on Linux.
+    """
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    priv_path = CONFIG_DIR / "client.private"
+    pub_path  = CONFIG_DIR / "client.public"
+
+    if priv_path.exists() and pub_path.exists():
+        info("Client keys already exist, reusing them.")
+        return priv_path.read_text().strip(), pub_path.read_text().strip()
+
+    info("Generating new client keypair...")
+
+    # `wg genkey` outputs a random base64-encoded 32-byte private key
+    priv_result = run("wg genkey")
+    private_key = priv_result.stdout.strip()
+
+    # Pipe the private key into `wg pubkey` to derive the public key
+    if IS_WINDOWS:
+        # On Windows, piping works differently in PowerShell
+        pub_result = subprocess.run(
+            ["powershell.exe", "-Command", f'echo "{private_key}" | wg pubkey'],
+            capture_output=True, text=True
+        )
+    else:
+        pub_result = subprocess.run(
+            "wg pubkey",
+            input=private_key,
+            shell=True, capture_output=True, text=True, check=True
+        )
+    public_key = pub_result.stdout.strip()
+
+    priv_path.write_text(private_key)
+    pub_path.write_text(public_key)
+
+    # On Windows, we can't chmod, but the file is in the user's home dir
+    # which is already protected by Windows ACLs (access control lists).
+    if not IS_WINDOWS:
+        run(f"chmod 600 {priv_path}")
+
+    ok(f"Client keypair saved to {CONFIG_DIR}")
+    return private_key, public_key
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WRITE CLIENT CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+
+def write_client_config(client_private_key: str) -> Path:
+    """
+    Write the WireGuard client config file (wg0-client.conf).
+
+    CLIENT CONFIG STRUCTURE:
+
+    [Interface]
+      PrivateKey — WPC's secret key (never shared)
+      Address    — WPC's IP inside the VPN (10.0.0.2/24)
+      DNS        — which DNS server to use for name lookups inside the VPN
+                   DNS = Domain Name System. It's like a phone book:
+                   you give it a name (google.com) and it returns an IP (142.250.x.x).
+                   We point to the server (10.0.0.1) so DNS queries go through the tunnel.
+
+    [Peer]  (the server)
+      PublicKey  — the server's public key (we verify this is really our server)
+      Endpoint   — server's real-world IP:port (WL's Windows IP, port 51820)
+      AllowedIPs — which traffic goes through the tunnel
+                   0.0.0.0/0 means ALL traffic — full tunnel mode.
+                   You could also use just 10.0.0.0/24 to only route VPN traffic
+                   (split tunnel mode) — useful to keep local traffic fast.
+      PersistentKeepalive — send a packet every 25 seconds to keep the tunnel alive.
+                   WHY: NAT devices (routers) forget UDP connections after ~30s of
+                   silence. Without keepalive, the tunnel goes silent and the
+                   connection breaks. Keepalive prevents that.
+    """
+    config_path = CONFIG_DIR / "wg0-client.conf"
+
+    config = f"""# WireGuard Client Config for WPC
+# Generated by cli.py — do not share this file (it contains your private key)
+
+[Interface]
+PrivateKey = {client_private_key}
+Address = {CLIENT_VPN_IP}/24
+DNS = {SERVER_VPN_IP_FOR_DNS}
+
+[Peer]
+# This is the VPN server (WL)
+PublicKey = {SERVER_PUBLIC_KEY}
+
+# Endpoint = real-world address of the server
+# Format: IP:Port or hostname:Port
+Endpoint = {SERVER_ENDPOINT}:{SERVER_PORT}
+
+# AllowedIPs = which destination IPs get sent through the tunnel
+# 0.0.0.0/0 = everything (all traffic goes through VPN — "full tunnel")
+# 10.0.0.0/24 = only VPN subnet traffic ("split tunnel" — faster for browsing)
+AllowedIPs = 0.0.0.0/0
+
+# Send a keepalive ping every 25 seconds so NAT mappings don't expire
+PersistentKeepalive = 25
+"""
+
+    config_path.write_text(config)
+    ok(f"Client config written to {config_path}")
+    return config_path
+
+# Server's VPN IP (used as DNS)
+SERVER_VPN_IP_FOR_DNS = "10.0.0.1"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONNECT / DISCONNECT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cmd_connect():
+    """
+    Connect WPC to the VPN server on WL.
+
+    Sequence:
+    1. Load (or generate) the client config
+    2. Call wg-quick up — this:
+       a. Creates a virtual network interface (utun0 on macOS, a TUN adapter on Windows)
+       b. Configures it with our IP address (10.0.0.2)
+       c. Adds routes: 0.0.0.0/0 → wg0 (all traffic through VPN)
+       d. Performs the WireGuard handshake with the server
+
+    TUN ADAPTER: A TUN (network TUNnel) interface is a virtual network card
+    that exists only in software. Packets you send to it are handed to
+    WireGuard instead of going out a real ethernet port. WireGuard encrypts
+    them and sends them via UDP to the real server. Incoming encrypted UDP
+    packets from the server get decrypted and injected back through the TUN
+    interface as if they arrived on a normal network card.
+
+    ROUTING: Your OS keeps a routing table — a map of "if the destination is
+    X, send the packet out interface Y." wg-quick adds an entry saying "send
+    everything out the wg0 interface." Your normal internet traffic goes through
+    the VPN server instead of directly to the internet.
+    """
+    header("Connecting to VPN")
+
+    # Check that the user has filled in the configuration
+    if SERVER_ENDPOINT == "YOUR_WL_WINDOWS_IP_HERE":
+        err("You haven't set SERVER_ENDPOINT in cli.py!")
+        err("Open cli.py in a text editor and fill in your server's IP address.")
+        err("You can find it by running `ipconfig` on WL and looking for the IPv4 address.")
+        sys.exit(1)
+
+    if SERVER_PUBLIC_KEY == "PASTE_SERVER_PUBLIC_KEY_HERE":
+        err("You haven't set SERVER_PUBLIC_KEY in cli.py!")
+        err("Run `python3 orchestrator.py start` on WL and copy the public key it prints.")
+        sys.exit(1)
+
+    step(1, 3, "Preparing client configuration...")
+    priv_key, pub_key = generate_client_keypair()
+    config_path = write_client_config(priv_key)
+
+    step(2, 3, "Bringing WireGuard tunnel up...")
+    if IS_WINDOWS:
+        # wg-quick doesn't exist on Windows. WireGuard for Windows uses
+        # wireguard.exe /installtunnel which registers the tunnel as a
+        # Windows service and brings it up immediately.
+        result = run(f'wireguard.exe /installtunnel "{config_path}"', check=False)
+        if result.returncode != 0:
+            err(f"wireguard.exe failed:\n    {result.stdout.strip() or result.stderr.strip()}")
+            print()
+            info("Common fixes:")
+            info("  1. Run PowerShell as Administrator")
+            info("  2. Reinstall WireGuard for Windows: https://www.wireguard.com/install/")
+            info("  3. Check the server is running: python3 orchestrator.py status (on WL)")
+            sys.exit(1)
+        ok("WireGuard tunnel is UP")
+    else:
+        result = run(f"sudo wg-quick up {config_path}", check=False)
+        if result.returncode != 0:
+            if "already exists" in result.stderr:
+                warn("Tunnel already active. Run `python cli.py disconnect` first.")
+            else:
+                err(f"wg-quick failed:\n    {result.stderr.strip()}")
+                sys.exit(1)
+        else:
+            ok("WireGuard tunnel is UP")
+
+    step(3, 3, "Verifying connection...")
+    time.sleep(2)  # give the tunnel a moment to establish
+    _verify_connection()
+
+def _verify_connection():
+    """Ping the VPN server to verify the tunnel is working."""
+    server_vpn_ip = "10.0.0.1"
+    info(f"Pinging VPN server at {server_vpn_ip}...")
+
+    if IS_WINDOWS:
+        result = run(f"ping -n 3 {server_vpn_ip}", check=False)
+    else:
+        result = run(f"ping -c 3 {server_vpn_ip}", check=False)
+
+    if result.returncode == 0:
+        ok(f"Connected! VPN server ({server_vpn_ip}) is reachable.")
+        ok(f"Your VPN IP: {CLIENT_VPN_IP}")
+        print()
+        info("All your internet traffic is now routed through WL.")
+        info("To disconnect: python cli.py disconnect")
+    else:
+        warn("Tunnel is up but server ping failed.")
+        warn("Possible reasons:")
+        warn("  - Server might not be running (check: python3 orchestrator.py status on WL)")
+        warn("  - Firewall on WL is blocking ICMP (ping) packets")
+        warn("  - Windows port forwarding isn't set up correctly")
+        print()
+        info("Try: python cli.py status — to see WireGuard handshake details")
+
+def cmd_disconnect():
+    """
+    Tear down the VPN tunnel.
+
+    `wg-quick down` reverses everything `wg-quick up` did:
+    - Removes the VPN routes from the routing table
+    - Destroys the TUN interface
+    - Runs any PostDown commands from the config
+    """
+    header("Disconnecting from VPN")
+
+    config_path = CONFIG_DIR / "wg0-client.conf"
+
+    if not config_path.exists():
+        warn("No client config found. Maybe you haven't connected yet?")
         return
 
-    print("Status: connected\n")
+    if IS_WINDOWS:
+        # /uninstalltunnel takes the tunnel NAME (filename without .conf extension)
+        tunnel_name = config_path.stem  # "wg0-client"
+        result = run(f'wireguard.exe /uninstalltunnel {tunnel_name}', check=False)
+    else:
+        result = run(f"sudo wg-quick down {config_path}", check=False)
+
+    if result.returncode != 0:
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        if "not found" in (stdout + stderr).lower() or "does not exist" in (stdout + stderr).lower():
+            info("Tunnel was already down.")
+        else:
+            warn(f"Error during disconnect: {stdout or stderr}")
+    else:
+        ok("VPN tunnel disconnected.")
+        info("Your traffic now goes directly to the internet (not through VPN).")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STATUS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cmd_status():
+    """
+    Show the current VPN status.
+
+    We check several things:
+    1. Is the wg0 interface up? (does `wg show` work?)
+    2. When was the last handshake? (recent = connected)
+    3. How much data has been transferred?
+    4. What's our public IP? (should be WL's IP when VPN is active)
+    """
+    header("VPN Status")
+
+    # Check WireGuard interface
+    result = run("wg show all", check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        warn("WireGuard tunnel is NOT active.")
+        info("To connect: python cli.py connect")
+        return
+
     print(result.stdout)
 
-    print("Public IP: ", end="", flush=True)
-    for url in ["https://ifconfig.me", "https://api.ipify.org"]:
-        try:
-            r = subprocess.run(
-                ["curl", "-s", "--max-time", "4", url],
-                capture_output=True, text=True
+    # Check public IP — if VPN is working, this should be WL's IP
+    print()
+    info("Checking your public IP address (should be WL's IP when VPN is on)...")
+    try:
+        if IS_WINDOWS:
+            ip_result = run(
+                "(Invoke-WebRequest -Uri 'https://api.ipify.org' -UseBasicParsing).Content",
+                check=False
             )
-            if r.returncode == 0 and r.stdout.strip():
-                print(r.stdout.strip())
-                return
-        except Exception:
-            continue
-    print("(could not fetch)")
+        else:
+            ip_result = run("curl -s https://api.ipify.org", check=False)
 
+        if ip_result.returncode == 0:
+            public_ip = ip_result.stdout.strip()
+            info(f"Your public IP: {public_ip}")
+            if SERVER_ENDPOINT != "YOUR_WL_WINDOWS_IP_HERE":
+                if SERVER_ENDPOINT in public_ip or public_ip == SERVER_ENDPOINT:
+                    ok("Public IP matches server — VPN routing is working!")
+                else:
+                    warn(f"Public IP ({public_ip}) doesn't match server ({SERVER_ENDPOINT})")
+                    warn("VPN tunnel may be up but routing may be incomplete.")
+    except Exception:
+        warn("Could not check public IP (network may be offline).")
 
-# ── Utils ─────────────────────────────────────────────────────────────────────
+def cmd_init():
+    """
+    First-time setup: generate keys and print the public key for the server.
 
-def run(cmd: list, ok_if_exists: bool = False):
-    """Run a command. Die on failure unless ok_if_exists and error is EEXIST."""
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    WORKFLOW:
+    1. Run `python cli.py init` on WPC → get your public key
+    2. Run `python3 orchestrator.py add-peer` on WL → paste the public key
+    3. Fill in SERVER_ENDPOINT and SERVER_PUBLIC_KEY in cli.py
+    4. Run `python cli.py connect` on WPC
+    """
+    header("First-Time Setup")
+
+    info("Generating client keypair for WPC...")
+    priv_key, pub_key = generate_client_keypair()
+
+    print()
+    print(f"{BOLD}Your WPC public key:{RESET}")
+    print(f"\n    {GREEN}{pub_key}{RESET}\n")
+    print("Next steps:")
+    print("  1. Copy the public key above.")
+    print("  2. On WL (in WSL2), run:")
+    print("       python3 orchestrator.py add-peer")
+    print("     Paste your public key when asked.")
+    print("  3. The server will print your assigned VPN IP and its own public key.")
+    print("  4. Open cli.py in a text editor and fill in:")
+    print("       SERVER_ENDPOINT  = WL's Windows IP address")
+    print("       SERVER_PUBLIC_KEY = the key the server printed")
+    print("       CLIENT_VPN_IP    = the VPN IP the server assigned you")
+    print("  5. Run: python cli.py connect")
+
+def cmd_ping():
+    """Ping the VPN server to test latency."""
+    header("Ping VPN Server")
+    server_ip = "10.0.0.1"
+
+    if IS_WINDOWS:
+        result = run(f"ping -n 5 {server_ip}", check=False, capture=False)
+    else:
+        result = run(f"ping -c 5 {server_ip}", check=False, capture=False)
+
     if result.returncode != 0:
-        stderr = result.stderr.strip()
-        if ok_if_exists and "File exists" in stderr:
-            return   # route already there — fine
-        die(f"Command failed: {' '.join(cmd)}\n{stderr}")
+        err(f"Could not reach {server_ip}. Is the VPN connected?")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
 
-def die(msg: str):
-    print(f"Error: {msg}", file=sys.stderr)
-    sys.exit(1)
+COMMANDS = {
+    "init":       (cmd_init,       "First-time setup: generate keys"),
+    "connect":    (cmd_connect,    "Connect to the VPN"),
+    "disconnect": (cmd_disconnect, "Disconnect from the VPN"),
+    "status":     (cmd_status,     "Show connection status"),
+    "ping":       (cmd_ping,       "Ping the VPN server"),
+}
 
-
-# ── Entry ─────────────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(
-        prog="vpn",
-        description="Minimal WireGuard VPN client"
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    sub.add_parser("init",   help="Generate keypair and create config")
-    sub.add_parser("up",     help="Connect to VPN (run with sudo -E)")
-    sub.add_parser("down",   help="Disconnect (run with sudo -E)")
-    sub.add_parser("status", help="Show connection status")
-
-    reg = sub.add_parser("register", help="Register with server, get VPN IP")
-    reg.add_argument("name", help="Your name e.g. jake")
-
-    args = parser.parse_args()
-
-    {
-        "init":     cmd_init,
-        "up":       cmd_up,
-        "down":     cmd_down,
-        "status":   cmd_status,
-        "register": cmd_register,
-    }[args.command](args)
-
+def usage():
+    print(f"\n{BOLD}cli.py — WireGuard VPN Client{RESET}")
+    print(f"\nUsage: python cli.py <command>\n")
+    print("Commands:")
+    for cmd, (fn, desc) in COMMANDS.items():
+        print(f"  {cmd:15s}  {desc}")
+    print()
+    print("First time? Run:  python cli.py init")
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        usage()
+        sys.exit(0 if len(sys.argv) < 2 else 1)
+
+    COMMANDS[sys.argv[1]][0]()
