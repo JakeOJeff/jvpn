@@ -98,8 +98,12 @@
     # forwarding, Linux says "that's not for me" and drops it. With forwarding
     # enabled, Linux routes it onward — acting as a router.
     # This is the same setting as `sysctl net.ipv4.ip_forward=1`.
-    enableIPv4Forwarding = true;
-    enableIPv6Forwarding = false; # Keep simple for now
+  };
+
+  # Enable IP forwarding via kernel sysctl
+  # (networking.enableIPv4Forwarding was removed in newer NixOS)
+  boot.kernel.sysctl = {
+    "net.ipv4.ip_forward" = 1;
   };
 
   # ───────────────────────────────────────────────────────────────────────────
