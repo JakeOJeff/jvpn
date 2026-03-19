@@ -1,35 +1,54 @@
 ## Structure
 
-### On Server (WSL Debian/Linux Dis):
-~/jvpn/
-├── orchestrator.py    (server)
-└── server.nix         (NixOS config)
-### On Client:
-jvpn\
-└── cli.py             (client)
 
 
-## Server Setup
 
-### Start Server
+## Setup
 
+### NixOS Setup
+
+
+Copy the Configuration to Nix
 ```bash
-cd ~/jvpn
-python3 orchestrator.py
+cp configuration.nix /etc/nixos/configuration.nix
 ```
 
-### Get Server IP
 
+Add Latest NixOS Channel
 ```bash
-## wsl 
-hostname -I
+sudo nix-channel --add https://nixos.org/channels/nixos-unstable nixos
 ```
 
-### Client Connection
-
+Check/Add Latest Updates
 ```bash
-cd Path/To/Vpn
-python cli.py --server [server-ip]
+sudo nix-channel --update
 ```
 
+Rebuild NixOS with Latest Configuration
+```bash
+sudo nixos-rebuild switch
+```
+
+For Stable version, use 25.05 ( Unverified )
+```bash
+sudo nix-channel --add https://nixos.org/channels/nixos-25.05 nixos
+sudo nix-channel --update
+sudo nixos-rebuild switch
+```
+
+### Routine Check/Verification
+
+```bash
+# WireGuard tools are installed
+wg --version
+
+# Python is there
+python3 --version
+
+# IP forwarding is enabled (should print 1)
+cat /proc/sys/net/ipv4/ip_forward
+
+# Git is there
+git --version
+```
 
