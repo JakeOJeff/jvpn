@@ -35,6 +35,7 @@
     python3
     vim
     nano
+    socat
   ];
 
   services.openssh = {
